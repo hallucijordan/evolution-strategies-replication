@@ -1,0 +1,16 @@
+# Evolution Strategies config for Pong
+# Based on hyperparameters from Salimans et al. [2017] Table S2 (Atari)
+#
+# Usage:
+#   python train.py --algo es --env PongNoFrameskip-v4 --config configs/es_pong.yaml
+
+algorithm:
+  sigma: 0.1          # Perturbation noise std
+  lr: 0.01             # Learning rate
+  population_size: 200 # Even number (mirrored sampling)
+  weight_decay: 0.005  # L2 regularization
+  n_workers: 10         # Set to CPU count for parallel rollouts, e.g. 8 or 16
+  seed: 42
+
+training:
+  total_steps: 1_000_000

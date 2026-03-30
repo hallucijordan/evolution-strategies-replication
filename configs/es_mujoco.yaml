@@ -1,0 +1,16 @@
+# Evolution Strategies config for MuJoCo environments
+# Based on Salimans et al. [2017] Table S1
+#
+# Usage:
+#   python train.py --algo es --env HalfCheetah-v4 --config configs/es_mujoco.yaml
+
+algorithm:
+  sigma: 0.02
+  lr: 0.01
+  population_size: 240
+  weight_decay: 0.005
+  n_workers: 1
+  seed: 42
+
+training:
+  total_steps: 5_000_000
