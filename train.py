@@ -15,8 +15,10 @@ import yaml
 
 from algorithms import REGISTRY
 from algorithms.es import ES, ESConfig
+from algorithms.dqn import DQN, DQNConfig
+from algorithms.a3c import A3C, A3CConfig
 from envs import make_atari_env, EnvFactory
-from models import AtariCNN, MLP, count_params
+from models import AtariCNN, MLP, ActorCriticCNN, ActorCriticMLP, count_params
 from utils.logger import Logger
 
 ATARI_ENVS = {"NoFrameskip", "ALE/"}   # keywords that identify Atari envs
@@ -40,6 +42,56 @@ def parse_args():
 
 def is_atari(env_id: str) -> bool:
     return any(k in env_id for k in ATARI_ENVS)
+
+
+def build_dqn(env_id: str, config_path: str | None) -> DQN:
+    overrides: dict = {}
+    if config_path:
+        with open(config_path) as f:
+            overrides = yaml.safe_load(f).get("algorithm", {})
+
+    cfg = DQNConfig(**overrides)
+
+    if is_atari(env_id):
+        tmp_env = make_atari_env(env_id)
+        policy = AtariCNN(tmp_env.action_space.n, use_vbn=False)
+        tmp_env.close()
+        print(f"Policy: AtariCNN (no VBN)  |  parameters: {count_params(policy):,}")
+    else:
+        import gymnasium as gym
+        tmp_env = gym.make(env_id)
+        obs_dim = tmp_env.observation_space.shape[0]
+        policy = MLP(obs_dim, tmp_env.action_space.n)
+        tmp_env.close()
+        print(f"Policy: MLP  |  parameters: {count_params(policy):,}")
+
+    return DQN(policy, cfg)
+
+
+def build_a3c(env_id: str, config_path: str | None, n_workers: int) -> A3C:
+    overrides: dict = {}
+    if config_path:
+        with open(config_path) as f:
+            overrides = yaml.safe_load(f).get("algorithm", {})
+    if n_workers > 1:
+        overrides["n_workers"] = n_workers
+
+    cfg = A3CConfig(**overrides)
+
+    if is_atari(env_id):
+        tmp_env = make_atari_env(env_id)
+        policy = ActorCriticCNN(tmp_env.action_space.n)
+        tmp_env.close()
+        print(f"Policy: ActorCriticCNN  |  parameters: {count_params(policy):,}")
+    else:
+        import gymnasium as gym
+        tmp_env = gym.make(env_id)
+        obs_dim = tmp_env.observation_space.shape[0]
+        policy = ActorCriticMLP(obs_dim, tmp_env.action_space.n)
+        tmp_env.close()
+        print(f"Policy: ActorCriticMLP  |  parameters: {count_params(policy):,}")
+
+    return A3C(policy, cfg)
 
 
 def build_es(env_id: str, config_path: str | None, n_workers: int) -> ES:
@@ -85,6 +137,10 @@ def main():
     # Build algorithm
     if args.algo == "es":
         agent = build_es(args.env, args.config, args.n_workers)
+    elif args.algo == "dqn":
+        agent = build_dqn(args.env, args.config)
+    elif args.algo == "a3c":
+        agent = build_a3c(args.env, args.config, args.n_workers)
     else:
         AlgoCls = REGISTRY[args.algo]
         agent = AlgoCls()

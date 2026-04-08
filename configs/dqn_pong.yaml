@@ -1,0 +1,22 @@
+# DQN config for Atari Pong
+# Based on Mnih et al. [2015] with reduced buffer size for memory
+#
+# Usage:
+#   python train.py --algo dqn --env PongNoFrameskip-v4 --config configs/dqn_pong.yaml
+
+algorithm:
+  lr: 0.0001
+  gamma: 0.99
+  buffer_size: 100000        # original paper uses 1M; reduced here for memory
+  batch_size: 32
+  target_update_freq: 1000   # hard copy every N steps
+  epsilon_start: 1.0
+  epsilon_end: 0.01
+  epsilon_decay_steps: 100000
+  learning_starts: 10000     # random play before first gradient update
+  train_freq: 4
+  max_grad_norm: 10.0
+  seed: 42
+
+training:
+  total_steps: 1000000
