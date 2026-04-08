@@ -1,0 +1,19 @@
+# A3C config for Atari Pong
+# Based on Mnih et al. [2016] Table S2
+#
+# Usage:
+#   python train.py --algo a3c --env PongNoFrameskip-v4 --config configs/a3c_pong.yaml
+#   python train.py --algo a3c --env PongNoFrameskip-v4 --config configs/a3c_pong.yaml --n_workers 8
+
+algorithm:
+  lr: 0.0001
+  gamma: 0.99
+  t_max: 20                  # rollout length per worker before gradient update
+  entropy_coef: 0.01         # entropy bonus — keeps policy from collapsing too early
+  value_coef: 0.5            # critic loss weight
+  max_grad_norm: 40.0
+  n_workers: 4               # set to CPU count for best throughput
+  seed: 42
+
+training:
+  total_steps: 1000000

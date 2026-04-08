@@ -12,14 +12,17 @@ import argparse
 import numpy as np
 
 from algorithms.es import ES, ESConfig
+from algorithms.dqn import DQN, DQNConfig
+from algorithms.a3c import A3C, A3CConfig
 from envs import make_atari_env
-from models import AtariCNN
+from models import AtariCNN, ActorCriticCNN
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--env",        required=True)
-    p.add_argument("--checkpoint", required=True, help="Path to .npy checkpoint")
+    p.add_argument("--checkpoint", required=True, help="Path to checkpoint (.npy for ES, .pt for DQN/A3C)")
+    p.add_argument("--algo",       choices=["es", "dqn", "a3c"], default="es")
     p.add_argument("--n_episodes", type=int, default=10)
     p.add_argument("--render",     action="store_true")
     return p.parse_args()
@@ -36,8 +39,16 @@ def main():
         render_mode=render_mode,
     )
 
-    policy = AtariCNN(env.action_space.n)
-    agent  = ES(policy, ESConfig())
+    if args.algo == "es":
+        policy = AtariCNN(env.action_space.n)
+        agent  = ES(policy, ESConfig())
+    elif args.algo == "dqn":
+        policy = AtariCNN(env.action_space.n, use_vbn=False)
+        agent  = DQN(policy, DQNConfig())
+    elif args.algo == "a3c":
+        policy = ActorCriticCNN(env.action_space.n)
+        agent  = A3C(policy, A3CConfig())
+
     agent.load(args.checkpoint)
 
     print(f"Evaluating checkpoint: {args.checkpoint}")
