@@ -8,12 +8,13 @@
 algorithm:
   lr: 0.0001
   gamma: 0.99
-  t_max: 20                  # rollout length per worker before gradient update
+  t_max: 128                 # rollout length per worker before gradient update
   entropy_coef: 0.01         # entropy bonus — keeps policy from collapsing too early
   value_coef: 0.5            # critic loss weight
   max_grad_norm: 40.0
-  n_workers: 4               # set to CPU count for best throughput
+  n_workers: 4               # GPU模式下4-6个worker，避免GPU争用
   seed: 42
+  ckpt_interval: 5000      # save checkpoint every N environment steps
 
 training:
   total_steps: 1000000
