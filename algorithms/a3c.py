@@ -3,24 +3,24 @@ Advantage Actor-Critic (A3C / A2C) — Mnih et al. [2016], arXiv:1602.01783.
 
 Implements:
   - n_workers parallel rollout workers using multiprocessing.Pool
-    (same pattern as ES — workers receive numpy arrays, return numpy arrays)
   - n-step return with advantage estimation
   - Entropy regularisation for exploration
   - Gradient norm clipping
   - Main process owns the Adam optimizer and applies averaged gradients
 
-Worker design mirrors algorithms/es.py:
-  _a3c_worker_task(args) takes plain picklable args and returns plain numpy.
-  No shared PyTorch state, no locks, no shared memory needed.
-  This avoids fork/spawn incompatibilities with PyTorch internal threads.
+Worker design:
+  Each worker process is initialised ONCE via Pool initializer with its own
+  env and network copy.  Subsequent iterations only send flat_params (a small
+  numpy array) — the full model is never pickled after startup.
+  The env persists across iterations so episodes can complete naturally.
 
-Note: synchronous gradient aggregation (A2C style). Equivalent to A3C in
-practice and significantly more stable on single-machine setups.
+Note: synchronous gradient aggregation (A2C style).
 """
 
 from __future__ import annotations
 
 import copy
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -43,16 +43,46 @@ from models.atari_cnn import get_flat_params, set_flat_params
 class A3CConfig:
     lr:            float = 1e-4
     gamma:         float = 0.99
-    t_max:         int   = 20     # steps per worker rollout before gradient update
-    entropy_coef:  float = 0.01   # weight on entropy bonus (exploration)
-    value_coef:    float = 0.5    # weight on critic loss
+    t_max:         int   = 128    # steps per worker rollout before gradient update
+    entropy_coef:  float = 0.01
+    value_coef:    float = 0.5
     max_grad_norm: float = 40.0
-    n_workers:     int   = 4
+    n_workers:     int   = 18     # set to CPU count - 2
     seed:          int   = 0
+    ckpt_interval: int   = 50_000
 
 
 # ---------------------------------------------------------------------------
-# Worker (module-level, mirrors ES's _worker_task — picklable for Pool.map)
+# Persistent worker state (one copy per worker process)
+# ---------------------------------------------------------------------------
+
+_worker_net:      nn.Module | None = None
+_worker_env                        = None
+_worker_obs:      np.ndarray | None = None
+_worker_ep_accum: float            = 0.0
+_worker_device:   str              = "cpu"
+
+
+def _worker_init(env_fn: Callable, policy_template: nn.Module) -> None:
+    """Initialise persistent state for this worker process (called once)."""
+    global _worker_net, _worker_env, _worker_obs, _worker_ep_accum, _worker_device
+
+    seed = os.getpid()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.set_num_threads(1)   # prevent CPU thread contention between workers
+
+    _worker_device = "cuda" if torch.cuda.is_available() else "cpu"
+    _worker_net = copy.deepcopy(policy_template).to(_worker_device)
+    _worker_net.train()
+
+    _worker_env = env_fn()
+    _worker_obs, _ = _worker_env.reset()
+    _worker_ep_accum = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Worker task — only receives flat_params (small numpy array) each iteration
 # ---------------------------------------------------------------------------
 
 def _obs_to_tensor(obs: np.ndarray) -> torch.Tensor:
@@ -62,47 +92,35 @@ def _obs_to_tensor(obs: np.ndarray) -> torch.Tensor:
 
 def _a3c_worker_task(args):
     """
-    Single rollout for one worker.  Mirrors ES's _worker_task:
-      - receives only plain picklable objects (numpy arrays, config, env factory)
-      - returns plain numpy arrays (gradients) and Python scalars
+    Run one t_max-step rollout using the persistent env and network.
 
-    Args (packed as tuple for pool.map compatibility):
-        env_fn:           callable returning a fresh gym.Env
-        flat_params:      current global policy parameters (float32 numpy)
-        policy_template:  nn.Module used as architecture blueprint (deepcopied)
-        cfg:              A3CConfig
-        worker_seed:      int
+    Args (tuple):
+        flat_params:  current global policy parameters (float32 numpy)
+        cfg:          A3CConfig
 
     Returns:
-        flat_grads:  float32 numpy array, same shape as flat_params
-        n_steps:     int, environment steps taken in this rollout
-        ep_return:   float if an episode completed, else None
+        flat_grads:  float32 numpy array
+        n_steps:     int
+        ep_return:   float if an episode completed this rollout, else None
     """
-    env_fn, flat_params, policy_template, cfg, worker_seed = args
+    global _worker_net, _worker_env, _worker_obs, _worker_ep_accum, _worker_device
 
-    torch.manual_seed(worker_seed)
-    np.random.seed(worker_seed)
+    flat_params, cfg = args
 
-    # Rebuild local network from the architecture template + current params
-    local_net = copy.deepcopy(policy_template)
-    set_flat_params(local_net, flat_params)
-    local_net.train()
-
-    env       = env_fn()
-    obs, _    = env.reset()
-    ep_return = None
-    ep_accum  = 0.0
+    set_flat_params(_worker_net, flat_params)
+    _worker_net.train()
 
     rewards, values, log_probs, entropies = [], [], [], []
+    ep_return = None
     done = False
 
     for _ in range(cfg.t_max):
-        x           = _obs_to_tensor(obs)
-        logits, val = local_net(x)
+        x           = _obs_to_tensor(_worker_obs).to(_worker_device)
+        logits, val = _worker_net(x)
         dist        = Categorical(logits=logits.squeeze(0))
         action      = dist.sample()
 
-        next_obs, reward, terminated, truncated, _ = env.step(action.item())
+        next_obs, reward, terminated, truncated, _ = _worker_env.step(action.item())
         done = terminated or truncated
 
         rewards.append(float(reward))
@@ -110,14 +128,15 @@ def _a3c_worker_task(args):
         log_probs.append(dist.log_prob(action))
         entropies.append(dist.entropy())
 
-        obs        = next_obs
-        ep_accum  += float(reward)
+        _worker_ep_accum += float(reward)
+        _worker_obs = next_obs
 
         if done:
-            ep_return = ep_accum
+            ep_return        = _worker_ep_accum
+            _worker_obs, _   = _worker_env.reset()
+            _worker_ep_accum = 0.0
             break
 
-    env.close()
     n_steps = len(rewards)
 
     # Bootstrap value for the last state
@@ -125,13 +144,13 @@ def _a3c_worker_task(args):
         R: float = 0.0
     else:
         with torch.no_grad():
-            _, R_t = local_net(_obs_to_tensor(obs))
+            _, R_t = _worker_net(_obs_to_tensor(_worker_obs).to(_worker_device))
             R = float(R_t.item())
 
-    # Compute A3C losses (reverse through rollout for n-step returns)
-    actor_loss  = torch.zeros(1)
-    critic_loss = torch.zeros(1)
-    entropy_sum = torch.zeros(1)
+    # Compute A3C losses
+    actor_loss  = torch.zeros(1, device=_worker_device)
+    critic_loss = torch.zeros(1, device=_worker_device)
+    entropy_sum = torch.zeros(1, device=_worker_device)
 
     for i in reversed(range(n_steps)):
         R           = rewards[i] + cfg.gamma * R
@@ -146,19 +165,19 @@ def _a3c_worker_task(args):
         - cfg.entropy_coef * entropy_sum
     )
 
-    local_net.zero_grad()
+    _worker_net.zero_grad()
     total_loss.backward()
-    nn.utils.clip_grad_norm_(local_net.parameters(), cfg.max_grad_norm)
+    nn.utils.clip_grad_norm_(_worker_net.parameters(), cfg.max_grad_norm)
 
-    # Return gradients as flat numpy array (same convention as flat_params)
     flat_grads = np.concatenate([
         p.grad.detach().cpu().numpy().ravel()
         if p.grad is not None
         else np.zeros(p.numel(), dtype=np.float32)
-        for p in local_net.parameters()
+        for p in _worker_net.parameters()
     ]).astype(np.float32)
 
-    return flat_grads, n_steps, ep_return
+    mean_entropy = float(entropy_sum.item() / max(n_steps, 1))
+    return flat_grads, n_steps, ep_return, mean_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -166,17 +185,6 @@ def _a3c_worker_task(args):
 # ---------------------------------------------------------------------------
 
 class A3C(BaseAlgorithm):
-    """
-    A3C / A2C agent.
-
-    Uses multiprocessing.Pool (same as ES) — workers are stateless, receive
-    numpy arrays, and return numpy arrays.  The main process owns the optimizer
-    and applies the averaged gradients after each batch of parallel rollouts.
-
-    Args:
-        policy:  An ActorCriticCNN or ActorCriticMLP instance.
-        config:  A3CConfig.  Defaults are used if None.
-    """
 
     def __init__(self, policy: nn.Module, config: A3CConfig | None = None):
         self.policy = policy
@@ -188,50 +196,53 @@ class A3C(BaseAlgorithm):
 
     def train(self, env_fn: Callable, total_steps: int, logger) -> None:
         import multiprocessing as mp
+        from collections import deque
 
         cfg       = self.config
         optimizer = optim.Adam(self.policy.parameters(), lr=cfg.lr)
 
-        from collections import deque
+        steps           = 0
+        generation      = 0
+        episode         = 0
+        recent_returns  = deque(maxlen=20)
+        last_ckpt_steps = 0
 
-        steps          = 0
-        generation     = 0
-        episode        = 0
-        recent_returns = deque(maxlen=20)   # rolling window for mean_return
+        ctx = mp.get_context("spawn")
 
-        ctx  = mp.get_context("spawn")
-        pool = ctx.Pool(cfg.n_workers) if cfg.n_workers > 1 else None
+        # Workers are initialised ONCE with env + model; only flat_params
+        # is sent on each subsequent pool.map call.
+        pool = ctx.Pool(
+            cfg.n_workers,
+            initializer=_worker_init,
+            initargs=(env_fn, self.policy),
+        ) if cfg.n_workers > 1 else None
 
         try:
             while steps < total_steps:
-                t0 = time.time()
-
-                # Snapshot current parameters as numpy (passed to workers)
+                t0          = time.time()
                 flat_params = get_flat_params(self.policy)
 
-                tasks = [
-                    (env_fn, flat_params, self.policy,
-                     cfg, cfg.seed + generation * cfg.n_workers + rank)
-                    for rank in range(cfg.n_workers)
-                ]
+                tasks = [(flat_params, cfg)] * cfg.n_workers
 
                 if pool is not None:
                     results = pool.map(_a3c_worker_task, tasks)
                 else:
-                    results = [_a3c_worker_task(t) for t in tasks]
+                    # Single-worker fallback: initialise once then loop
+                    if generation == 0:
+                        _worker_init(env_fn, self.policy)
+                    results = [_a3c_worker_task(tasks[0])]
 
-                # --- Aggregate gradients across workers ---
-                all_grads   = np.stack([r[0] for r in results])   # (n_workers, D)
-                batch_steps = sum(r[1] for r in results)
-                ep_returns  = [r[2] for r in results if r[2] is not None]
+                all_grads    = np.stack([r[0] for r in results])
+                batch_steps  = sum(r[1] for r in results)
+                ep_returns   = [r[2] for r in results if r[2] is not None]
+                mean_entropy = float(np.mean([r[3] for r in results]))
 
-                avg_grads = all_grads.mean(axis=0)                # (D,)
+                avg_grads = all_grads.mean(axis=0)
 
-                # --- Apply averaged gradients with Adam ---
                 optimizer.zero_grad()
                 idx = 0
                 for p in self.policy.parameters():
-                    n = p.numel()
+                    n      = p.numel()
                     p.grad = torch.from_numpy(
                         avg_grads[idx: idx + n].reshape(p.shape)
                     )
@@ -243,16 +254,22 @@ class A3C(BaseAlgorithm):
                 episode    += len(ep_returns)
                 recent_returns.extend(ep_returns)
 
-                # Only log when at least one episode has completed — avoids NaN
-                # rows that would make benchmark.py skip this run entirely.
-                if recent_returns:
-                    logger.log(
-                        steps=steps,
-                        generation=generation,
-                        episode=episode,
-                        mean_return=float(np.mean(recent_returns)),
-                        gen_time=round(time.time() - t0, 2),
-                    )
+                logger.log(
+                    steps=steps,
+                    generation=generation,
+                    episode=episode,
+                    mean_return=float(np.mean(recent_returns)) if recent_returns else float("nan"),
+                    mean_entropy=round(mean_entropy, 4),
+                    gen_time=round(time.time() - t0, 2),
+                )
+
+                if steps - last_ckpt_steps >= cfg.ckpt_interval:
+                    ckpt   = logger.checkpoint_dir / f"step_{steps}.pt"
+                    latest = logger.checkpoint_dir / "latest.pt"
+                    torch.save(self.policy.state_dict(), ckpt)
+                    torch.save(self.policy.state_dict(), latest)
+                    print(f"[ckpt] saved → {ckpt}")
+                    last_ckpt_steps = steps
 
         finally:
             if pool is not None:
