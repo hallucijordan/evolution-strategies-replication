@@ -123,7 +123,8 @@ class AtariCNN(nn.Module):
         Greedy action selection (deterministic policy, as used in ES).
         obs: (4, 84, 84) uint8 numpy array
         """
-        x = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0) / 255.0
+        device = next(self.parameters()).device
+        x = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(device) / 255.0
         logits = self.forward(x)
         return int(logits.argmax(dim=1).item())
 

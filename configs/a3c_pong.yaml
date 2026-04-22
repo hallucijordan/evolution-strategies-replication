@@ -1,20 +1,20 @@
-# A3C config for Atari Pong
-# Based on Mnih et al. [2016] Table S2
+# A3C/A2C config for Atari Pong
+# Based on Mnih et al. [2016] Table S2 and Stable Baselines3 A2C Atari defaults
 #
 # Usage:
 #   python train.py --algo a3c --env PongNoFrameskip-v4 --config configs/a3c_pong.yaml
-#   python train.py --algo a3c --env PongNoFrameskip-v4 --config configs/a3c_pong.yaml --n_workers 8
 
 algorithm:
-  lr: 0.0001
+  lr: 0.0007
   gamma: 0.99
-  t_max: 128                 # rollout length per worker before gradient update
-  entropy_coef: 0.01         # entropy bonus — keeps policy from collapsing too early
-  value_coef: 0.5            # critic loss weight
-  max_grad_norm: 40.0
-  n_workers: 4               # GPU模式下4-6个worker，避免GPU争用
+  gae_lambda: 1.0            # original A3C paper uses 1.0 (pure n-step returns)
+  t_max: 5                   # original paper; small t_max = frequent updates (125K/10M steps)
+  entropy_coef: 0.0          # SB3 A2C Atari default; non-zero entropy fights weak actor gradient
+  value_coef: 0.25           # SB3 A2C default; prevents critic loss from dominating actor
+  max_grad_norm: 0.5
+  n_workers: 16              # 5 × 16 = 80 transitions per update
   seed: 42
-  ckpt_interval: 5000      # save checkpoint every N environment steps
+  ckpt_interval: 50000
 
 training:
-  total_steps: 1000000
+  total_steps: 10000000

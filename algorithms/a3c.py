@@ -1,26 +1,22 @@
 """
-Advantage Actor-Critic (A3C / A2C) — Mnih et al. [2016], arXiv:1602.01783.
+Advantage Actor-Critic (A2C/A3C) — Mnih et al. [2016], arXiv:1602.01783.
 
-Implements:
-  - n_workers parallel rollout workers using multiprocessing.Pool
-  - n-step return with advantage estimation
+Implements synchronous A2C using SyncVectorEnv:
+  - n_workers parallel envs collected in the main process (no subprocess overhead)
+  - GAE (Generalized Advantage Estimation) — Schulman et al. [2015], arXiv:1506.02438
   - Entropy regularisation for exploration
   - Gradient norm clipping
-  - Main process owns the Adam optimizer and applies averaged gradients
+  - Single optimizer step per rollout (A2C style, no PPO clipping)
 
-Worker design:
-  Each worker process is initialised ONCE via Pool initializer with its own
-  env and network copy.  Subsequent iterations only send flat_params (a small
-  numpy array) — the full model is never pickled after startup.
-  The env persists across iterations so episodes can complete naturally.
-
-Note: synchronous gradient aggregation (A2C style).
+Why SyncVectorEnv instead of spawn multiprocessing:
+  spawn processes have large inter-process communication overhead per round.
+  With small t_max (5-20 steps), communication cost >> computation cost, making
+  learning extremely inefficient. SyncVectorEnv runs all envs in the main process
+  with negligible overhead, allowing small t_max and high update frequency.
 """
 
 from __future__ import annotations
 
-import copy
-import os
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -32,7 +28,6 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 from .base import BaseAlgorithm
-from models.atari_cnn import get_flat_params, set_flat_params
 
 
 # ---------------------------------------------------------------------------
@@ -41,148 +36,27 @@ from models.atari_cnn import get_flat_params, set_flat_params
 
 @dataclass
 class A3CConfig:
-    lr:            float = 1e-4
+    lr:            float = 7e-4
     gamma:         float = 0.99
-    t_max:         int   = 128    # steps per worker rollout before gradient update
-    entropy_coef:  float = 0.01
-    value_coef:    float = 0.5
-    max_grad_norm: float = 40.0
-    n_workers:     int   = 18     # set to CPU count - 2
+    gae_lambda:    float = 1.0    # original paper uses 1.0 (n-step returns)
+    t_max:         int   = 5      # original paper uses 5; small = frequent updates
+    entropy_coef:  float = 0.0    # SB3 A2C default for Atari; non-zero entropy fights actor
+    value_coef:    float = 0.25   # SB3 A2C default; reduces critic domination of actor gradient
+    max_grad_norm: float = 0.5
+    n_workers:     int   = 16     # compensates for small t_max: 5×16=80 transitions/update
     seed:          int   = 0
     ckpt_interval: int   = 50_000
 
 
 # ---------------------------------------------------------------------------
-# Persistent worker state (one copy per worker process)
+# A3C/A2C algorithm
 # ---------------------------------------------------------------------------
 
-_worker_net:      nn.Module | None = None
-_worker_env                        = None
-_worker_obs:      np.ndarray | None = None
-_worker_ep_accum: float            = 0.0
-_worker_device:   str              = "cpu"
-
-
-def _worker_init(env_fn: Callable, policy_template: nn.Module) -> None:
-    """Initialise persistent state for this worker process (called once)."""
-    global _worker_net, _worker_env, _worker_obs, _worker_ep_accum, _worker_device
-
-    seed = os.getpid()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    torch.set_num_threads(1)   # prevent CPU thread contention between workers
-
-    _worker_device = "cuda" if torch.cuda.is_available() else "cpu"
-    _worker_net = copy.deepcopy(policy_template).to(_worker_device)
-    _worker_net.train()
-
-    _worker_env = env_fn()
-    _worker_obs, _ = _worker_env.reset()
-    _worker_ep_accum = 0.0
-
-
-# ---------------------------------------------------------------------------
-# Worker task — only receives flat_params (small numpy array) each iteration
-# ---------------------------------------------------------------------------
-
-def _obs_to_tensor(obs: np.ndarray) -> torch.Tensor:
-    x = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+def _obs_to_tensor(obs: np.ndarray, device: torch.device) -> torch.Tensor:
+    """obs: (n_envs, *obs_shape) uint8 -> float32 in [0, 1]."""
+    x = torch.from_numpy(obs.astype(np.float32)).to(device)
     return x / 255.0 if obs.dtype == np.uint8 else x
 
-
-def _a3c_worker_task(args):
-    """
-    Run one t_max-step rollout using the persistent env and network.
-
-    Args (tuple):
-        flat_params:  current global policy parameters (float32 numpy)
-        cfg:          A3CConfig
-
-    Returns:
-        flat_grads:  float32 numpy array
-        n_steps:     int
-        ep_return:   float if an episode completed this rollout, else None
-    """
-    global _worker_net, _worker_env, _worker_obs, _worker_ep_accum, _worker_device
-
-    flat_params, cfg = args
-
-    set_flat_params(_worker_net, flat_params)
-    _worker_net.train()
-
-    rewards, values, log_probs, entropies = [], [], [], []
-    ep_return = None
-    done = False
-
-    for _ in range(cfg.t_max):
-        x           = _obs_to_tensor(_worker_obs).to(_worker_device)
-        logits, val = _worker_net(x)
-        dist        = Categorical(logits=logits.squeeze(0))
-        action      = dist.sample()
-
-        next_obs, reward, terminated, truncated, _ = _worker_env.step(action.item())
-        done = terminated or truncated
-
-        rewards.append(float(reward))
-        values.append(val.squeeze(0))
-        log_probs.append(dist.log_prob(action))
-        entropies.append(dist.entropy())
-
-        _worker_ep_accum += float(reward)
-        _worker_obs = next_obs
-
-        if done:
-            ep_return        = _worker_ep_accum
-            _worker_obs, _   = _worker_env.reset()
-            _worker_ep_accum = 0.0
-            break
-
-    n_steps = len(rewards)
-
-    # Bootstrap value for the last state
-    if done:
-        R: float = 0.0
-    else:
-        with torch.no_grad():
-            _, R_t = _worker_net(_obs_to_tensor(_worker_obs).to(_worker_device))
-            R = float(R_t.item())
-
-    # Compute A3C losses
-    actor_loss  = torch.zeros(1, device=_worker_device)
-    critic_loss = torch.zeros(1, device=_worker_device)
-    entropy_sum = torch.zeros(1, device=_worker_device)
-
-    for i in reversed(range(n_steps)):
-        R           = rewards[i] + cfg.gamma * R
-        advantage   = R - values[i].item()
-        actor_loss  = actor_loss  - log_probs[i] * advantage
-        critic_loss = critic_loss + 0.5 * (R - values[i]) ** 2
-        entropy_sum = entropy_sum + entropies[i]
-
-    total_loss = (
-        actor_loss
-        + cfg.value_coef   * critic_loss
-        - cfg.entropy_coef * entropy_sum
-    )
-
-    _worker_net.zero_grad()
-    total_loss.backward()
-    nn.utils.clip_grad_norm_(_worker_net.parameters(), cfg.max_grad_norm)
-
-    flat_grads = np.concatenate([
-        p.grad.detach().cpu().numpy().ravel()
-        if p.grad is not None
-        else np.zeros(p.numel(), dtype=np.float32)
-        for p in _worker_net.parameters()
-    ]).astype(np.float32)
-
-    mean_entropy = float(entropy_sum.item() / max(n_steps, 1))
-    return flat_grads, n_steps, ep_return, mean_entropy
-
-
-# ---------------------------------------------------------------------------
-# A3C algorithm
-# ---------------------------------------------------------------------------
 
 class A3C(BaseAlgorithm):
 
@@ -195,86 +69,141 @@ class A3C(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def train(self, env_fn: Callable, total_steps: int, logger) -> None:
-        import multiprocessing as mp
+        import gymnasium as gym
         from collections import deque
 
-        cfg       = self.config
-        optimizer = optim.Adam(self.policy.parameters(), lr=cfg.lr)
+        cfg    = self.config
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy.to(device)
+        self.policy.train()
+
+        torch.manual_seed(cfg.seed)
+        np.random.seed(cfg.seed)
+
+        optimizer = optim.RMSprop(
+            self.policy.parameters(), lr=cfg.lr, alpha=0.99, eps=1e-5
+        )
+
+        # n_workers envs running in the main process — zero IPC overhead
+        env = gym.vector.SyncVectorEnv([env_fn] * cfg.n_workers)
+        obs, _ = env.reset(seed=cfg.seed)
 
         steps           = 0
         generation      = 0
         episode         = 0
+        ep_accum        = np.zeros(cfg.n_workers, dtype=np.float32)
         recent_returns  = deque(maxlen=20)
         last_ckpt_steps = 0
 
-        ctx = mp.get_context("spawn")
+        while steps < total_steps:
+            t0 = time.time()
 
-        # Workers are initialised ONCE with env + model; only flat_params
-        # is sent on each subsequent pool.map call.
-        pool = ctx.Pool(
-            cfg.n_workers,
-            initializer=_worker_init,
-            initargs=(env_fn, self.policy),
-        ) if cfg.n_workers > 1 else None
+            # Storage for rollout (obs/actions/rewards as numpy; no computation graph kept)
+            obs_list  = []
+            act_list  = []
+            rew_buf   = []
+            val_buf   = []   # detached values used for GAE
+            done_buf  = []
 
-        try:
-            while steps < total_steps:
-                t0          = time.time()
-                flat_params = get_flat_params(self.policy)
+            # ---- Rollout collection (no_grad: build computation graph only at update time) ----
+            with torch.no_grad():
+                for _ in range(cfg.t_max):
+                    x = _obs_to_tensor(obs, device)  # (n_workers, 4, 84, 84)
 
-                tasks = [(flat_params, cfg)] * cfg.n_workers
+                    logits, value = self.policy(x)   # (n_workers, n_act), (n_workers,)
+                    dist   = Categorical(logits=logits)
+                    action = dist.sample()           # (n_workers,)
 
-                if pool is not None:
-                    results = pool.map(_a3c_worker_task, tasks)
-                else:
-                    # Single-worker fallback: initialise once then loop
-                    if generation == 0:
-                        _worker_init(env_fn, self.policy)
-                    results = [_a3c_worker_task(tasks[0])]
+                    obs_list.append(x.cpu())
+                    act_list.append(action.cpu())
+                    val_buf.append(value.cpu())
 
-                all_grads    = np.stack([r[0] for r in results])
-                batch_steps  = sum(r[1] for r in results)
-                ep_returns   = [r[2] for r in results if r[2] is not None]
-                mean_entropy = float(np.mean([r[3] for r in results]))
+                    next_obs, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+                    done = terminated | truncated  # (n_workers,)
 
-                avg_grads = all_grads.mean(axis=0)
+                    rew_buf.append(torch.from_numpy(reward.astype(np.float32)))
+                    done_buf.append(torch.from_numpy(done.astype(np.float32)))
 
-                optimizer.zero_grad()
-                idx = 0
-                for p in self.policy.parameters():
-                    n      = p.numel()
-                    p.grad = torch.from_numpy(
-                        avg_grads[idx: idx + n].reshape(p.shape)
-                    )
-                    idx += n
-                optimizer.step()
+                    ep_accum += reward
+                    for i in range(cfg.n_workers):
+                        if done[i]:
+                            recent_returns.append(float(ep_accum[i]))
+                            episode     += 1
+                            ep_accum[i]  = 0.0
 
-                steps      += batch_steps
-                generation += 1
-                episode    += len(ep_returns)
-                recent_returns.extend(ep_returns)
+                    obs    = next_obs
+                    steps += cfg.n_workers
 
-                logger.log(
-                    steps=steps,
-                    generation=generation,
-                    episode=episode,
-                    mean_return=float(np.mean(recent_returns)) if recent_returns else float("nan"),
-                    mean_entropy=round(mean_entropy, 4),
-                    gen_time=round(time.time() - t0, 2),
-                )
+                # Bootstrap: V(next_obs) for non-terminal envs, 0 for terminal
+                _, last_val = self.policy(_obs_to_tensor(obs, device))
+                last_val = last_val.cpu() * (1.0 - done_buf[-1])
 
-                if steps - last_ckpt_steps >= cfg.ckpt_interval:
-                    ckpt   = logger.checkpoint_dir / f"step_{steps}.pt"
-                    latest = logger.checkpoint_dir / "latest.pt"
-                    torch.save(self.policy.state_dict(), ckpt)
-                    torch.save(self.policy.state_dict(), latest)
-                    print(f"[ckpt] saved → {ckpt}")
-                    last_ckpt_steps = steps
+            # ---- GAE computation (numpy, no grad needed) ----
+            values_np  = torch.stack(val_buf).numpy()   # (t_max, n_workers)
+            rewards_np = torch.stack(rew_buf).numpy()
+            dones_np   = torch.stack(done_buf).numpy()
+            last_np    = last_val.numpy()               # (n_workers,)
 
-        finally:
-            if pool is not None:
-                pool.close()
-                pool.join()
+            gae_np  = np.zeros(cfg.n_workers, dtype=np.float32)
+            adv_np  = np.zeros((cfg.t_max, cfg.n_workers), dtype=np.float32)
+
+            for t in reversed(range(cfg.t_max)):
+                next_nont = 1.0 - dones_np[t]
+                next_v    = values_np[t + 1] if t + 1 < cfg.t_max else last_np
+                delta     = rewards_np[t] + cfg.gamma * next_v * next_nont - values_np[t]
+                gae_np    = delta + cfg.gamma * cfg.gae_lambda * next_nont * gae_np
+                adv_np[t] = gae_np
+
+            ret_np = adv_np + values_np   # (t_max, n_workers)
+
+            # No advantage normalization: with sparse rewards and short rollouts the std
+            # can be near-zero, turning normalization into amplified noise.
+
+            # ---- Multiple gradient steps per rollout ----
+            obs_t = torch.stack(obs_list).to(device)        # (t_max, n_workers, 4, 84, 84)
+            act_t = torch.stack(act_list).to(device)        # (t_max, n_workers)
+            adv_t = torch.from_numpy(adv_np).to(device)     # (t_max, n_workers)
+            ret_t = torch.from_numpy(ret_np).to(device)     # (t_max, n_workers)
+
+            obs_flat = obs_t.flatten(0, 1)   # (t_max * n_workers, 4, 84, 84)
+            act_flat = act_t.flatten(0, 1)   # (t_max * n_workers,)
+            adv_flat = adv_t.flatten()
+            ret_flat = ret_t.flatten()
+
+            logits_all, values_all = self.policy(obs_flat)
+            dist_all    = Categorical(logits=logits_all)
+            log_probs   = dist_all.log_prob(act_flat)
+            entropy     = dist_all.entropy().mean()
+
+            actor_loss  = -(log_probs * adv_flat).mean()
+            critic_loss = 0.5 * (ret_flat - values_all).pow(2).mean()
+            loss        = actor_loss + cfg.value_coef * critic_loss - cfg.entropy_coef * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+            optimizer.step()
+
+            generation += 1
+
+            logger.log(
+                steps        = steps,
+                generation   = generation,
+                episode      = episode,
+                mean_return  = float(np.mean(recent_returns)) if recent_returns else float("nan"),
+                mean_entropy = round(float(entropy.item()), 4),
+                gen_time     = round(time.time() - t0, 2),
+            )
+
+            if steps - last_ckpt_steps >= cfg.ckpt_interval:
+                ckpt   = logger.checkpoint_dir / f"step_{steps}.pt"
+                latest = logger.checkpoint_dir / "latest.pt"
+                torch.save(self.policy.state_dict(), ckpt)
+                torch.save(self.policy.state_dict(), latest)
+                print(f"[ckpt] saved -> {ckpt}")
+                last_ckpt_steps = steps
+
+        env.close()
 
     # ------------------------------------------------------------------
     # Evaluation

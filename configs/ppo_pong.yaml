@@ -1,0 +1,23 @@
+# PPO config for Atari Pong
+# Based on Schulman et al. [2017] and Mnih et al. [2016] Atari hyperparameters
+#
+# Usage:
+#   python train.py --algo ppo --env PongNoFrameskip-v4 --config configs/ppo_pong.yaml
+
+algorithm:
+  lr: 2.5e-4
+  gamma: 0.99
+  gae_lambda: 0.95           # GAE lambda for advantage estimation
+  clip_eps: 0.1              # PPO clip range
+  n_steps: 128               # rollout steps per env before each update
+  n_envs: 8                  # parallel environments; effective batch = n_steps * n_envs = 1024
+  n_epochs: 4                # optimization passes per rollout
+  n_minibatches: 4           # mini-batches per epoch (batch_size = n_steps * n_envs // n_minibatches = 256)
+  entropy_coef: 0.01         # standard value; must be high enough to maintain exploration in Pong
+  value_coef: 0.5            # critic loss weight
+  max_grad_norm: 0.5
+  seed: 42
+  ckpt_interval: 50000       # save checkpoint every N environment steps
+
+training:
+  total_steps: 100000000
